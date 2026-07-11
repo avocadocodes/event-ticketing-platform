@@ -18,7 +18,7 @@ public class InventoryController {
     }
 
     @GetMapping("/{eventId}/availability")
-    public EventAvailabilityResponse availability(@PathVariable String eventId) {
+    public EventAvailabilityResponse availability(@PathVariable("eventId") String eventId) {
         return inventoryService.getEventAvailability(eventId);
     }
 }

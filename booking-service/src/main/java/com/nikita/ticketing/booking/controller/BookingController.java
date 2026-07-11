@@ -35,7 +35,7 @@ public class BookingController {
     }
 
     @GetMapping("/{id}")
-    public BookingResponse get(@PathVariable Long id) {
+    public BookingResponse get(@PathVariable("id") Long id) {
         return bookingService.getBooking(id);
     }
 }
