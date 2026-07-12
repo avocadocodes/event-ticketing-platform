@@ -1,7 +1,10 @@
 package com.nikita.ticketing.booking.domain;
 
 public enum BookingStatus {
-    RESERVED,
+    PENDING_RESERVATION,
+    AWAITING_PAYMENT,
     CONFIRMED,
+    REJECTED,
+    PAYMENT_FAILED,
     CANCELLED
 }

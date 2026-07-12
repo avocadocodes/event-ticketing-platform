@@ -40,7 +40,7 @@ class BookingControllerTest {
 
     @Test
     void createReturns201() throws Exception {
-        BookingResponse response = new BookingResponse(1L, "EVT-1", "CUST-1", 2, "RESERVED", LocalDateTime.now());
+        BookingResponse response = new BookingResponse(1L, "EVT-1", "CUST-1", 2, "PENDING_RESERVATION", LocalDateTime.now());
         when(bookingService.createBooking(any())).thenReturn(response);
 
         CreateBookingRequest req = new CreateBookingRequest("EVT-1", "CUST-1", 2);
@@ -54,7 +54,7 @@ class BookingControllerTest {
 
     @Test
     void listReturnsBookings() throws Exception {
-        BookingResponse response = new BookingResponse(1L, "EVT-1", "CUST-1", 2, "RESERVED", LocalDateTime.now());
+        BookingResponse response = new BookingResponse(1L, "EVT-1", "CUST-1", 2, "PENDING_RESERVATION", LocalDateTime.now());
         when(bookingService.getAllBookings()).thenReturn(List.of(response));
 
         mockMvc.perform(get("/bookings"))
@@ -64,7 +64,7 @@ class BookingControllerTest {
 
     @Test
     void getReturnsBooking() throws Exception {
-        BookingResponse response = new BookingResponse(1L, "EVT-1", "CUST-1", 2, "RESERVED", LocalDateTime.now());
+        BookingResponse response = new BookingResponse(1L, "EVT-1", "CUST-1", 2, "PENDING_RESERVATION", LocalDateTime.now());
         when(bookingService.getBooking(1L)).thenReturn(response);
 
         mockMvc.perform(get("/bookings/1"))

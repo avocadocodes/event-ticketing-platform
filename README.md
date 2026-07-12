@@ -1,133 +1,206 @@
 # Event Ticketing Platform
 
-A small, event-driven ticketing backend that shows how to keep a write-heavy
-booking flow responsive while a separate service owns seat inventory. Services
-talk to each other asynchronously over Kafka rather than through synchronous
-HTTP calls, so a slow or restarting inventory node never blocks a customer from
-placing a booking.
-
-## Problem Statement
-
-Selling tickets is a classic contention problem: many customers try to grab a
-limited pool of seats at the same time. A naive design puts booking creation
-and seat decrement in the same synchronous transaction, which couples the two
-concerns and makes the booking endpoint only as available as the inventory
-database.
-
-This project separates the two responsibilities:
-
-- **booking-service** accepts a booking, persists it in the `RESERVED` state,
-  and emits a `BookingCreated` event. It returns to the caller immediately.
-- **inventory-service** owns seat counts. It consumes `BookingCreated`, applies
-  the seat decrement idempotently, and publishes `SeatsReserved` or
-  `SeatsRejected` so downstream consumers can react.
-
-The trade-off is eventual consistency: a booking exists before its seats are
-confirmed. That is acceptable here and is the same model most high-volume
-ticketing systems use — reserve first, confirm asynchronously.
+A Kafka-backed microservices platform for booking event tickets, extended with a
+choreography-based saga, transactional outbox, seat holds, and a payment leg.
 
 ## Architecture
 
 ```
-                              ┌──────────────────┐
-                              │   API Gateway    │  :8080
-                              │ (Spring Cloud    │
-                              │   Gateway)       │
-                              └───────┬──────────┘
-                    /bookings/**      │      /inventory/**
-                 ┌────────────────────┴─────────────────────┐
-                 ▼                                           ▼
-        ┌──────────────────┐                       ┌──────────────────┐
-        │ booking-service  │  :8081                │ inventory-service│  :8082
-        │                  │                       │                  │
-        │  REST + JPA      │                       │  REST + JPA      │
-        └───────┬──────────┘                       └────────┬─────────┘
-                │                                            │
-                ▼                                            ▼
-        ┌──────────────┐                            ┌──────────────┐
-        │  booking_db  │                            │ inventory_db │
-        │ (PostgreSQL) │                            │ (PostgreSQL) │
-        └──────────────┘                            └──────────────┘
-                │                                            ▲
-                │  publish "bookings"                        │ consume "bookings"
-                │       BookingCreated                       │
-                └───────────────────►┌──────────┐────────────┘
-                                     │  Kafka   │
-                                     └────┬─────┘
-                                          │  publish "inventory"
-                                          ▼   SeatsReserved / SeatsRejected
-                                   (downstream consumers)
+                         ┌──────────────────────────┐
+                         │       API Gateway         │  :8080
+                         │   (Spring Cloud Gateway)  │
+                         └──────┬─────────┬──────────┘
+              /bookings/**      │         │ /inventory/**   /payments/**
+        ┌─────────────────┐     │         │     ┌──────────────────────────┐
+        ▼                 │     │         │     ▼                          │
+┌──────────────────┐      │     │    ┌──────────────────┐  ┌────────────────────┐
+│ booking-service  │:8081 │     │    │inventory-service │  │ payment-service    │
+│                  │      │     │    │             :8082 │  │             :8083  │
+│ REST + JPA       │      │     │    │ REST + JPA        │  │ REST + JPA + Redis │
+│ Outbox relay     │      │     │    │ Outbox relay      │  │ Resilience4j GW    │
+└───────┬──────────┘      │     │    └────────┬──────────┘  └────────────────────┘
+        │                 │     │             │
+        ▼                 │     │             ▼
+┌──────────────┐          │     │    ┌──────────────┐  ┌────────────┐  ┌─────────────┐
+│  booking_db  │          │     │    │ inventory_db │  │ payment_db │  │   Redis :6379│
+│ (PostgreSQL) │          │     │    │ (PostgreSQL) │  │(PostgreSQL)│  └─────────────┘
+└──────────────┘          │     │    └──────────────┘
+                          │     │
+        ┌─────────────────┘     └──────────────────────────────────────┐
+        │                                                               │
+        │  topic "bookings"                                             │
+        │  BookingCreated / BookingConfirmed / BookingPaymentFailed     │
+        ▼                                                               ▼
+  ┌──────────┐   topic "inventory"                             inventory-service
+  │  Kafka   │◄── SeatsReserved / SeatsRejected ──────────────────────►│
+  └──────────┘                                              booking-service consumes
 ```
 
-Three deployable modules plus a parent aggregator:
+### Modules
 
-| Module            | Port | Responsibility                                            |
-|-------------------|------|-----------------------------------------------------------|
-| `api-gateway`     | 8080 | Single entry point; routes to the two backend services    |
-| `booking-service` | 8081 | Create/list bookings; produce `BookingCreated`            |
-| `inventory-service` | 8082 | Own seat inventory; consume bookings; produce results     |
+| Module              | Port | Responsibility                                                    |
+|---------------------|------|-------------------------------------------------------------------|
+| `api-gateway`       | 8080 | Single entry point; routes to all three backend services          |
+| `booking-service`   | 8081 | Create bookings; run saga steps; call payment-service             |
+| `inventory-service` | 8082 | Own seat inventory; seat holds with TTL; saga compensation        |
+| `payment-service`   | 8083 | Process payments; Redis idempotency; Resilience4j gateway         |
 
-## Event Flow
+---
 
-1. A client `POST`s a booking through the gateway to `booking-service`.
-2. `booking-service` saves the booking as `RESERVED` and publishes a
-   `BookingCreated` event to the Kafka topic **`bookings`**, keyed by booking id.
-3. `inventory-service` consumes from **`bookings`**. For each event it:
-   - checks the `processed_bookings` table — if the booking id was already
-     handled, it stops (idempotency);
-   - looks up the event's inventory row;
-   - if seats are available, decrements `available_seats`, records the booking
-     as processed, and publishes `SeatsReserved` to the **`inventory`** topic;
-   - if the event is unknown or seats are insufficient, it records the booking
-     as processed and publishes `SeatsRejected` instead.
+## Saga — Event Flow
 
-Because the consumer is idempotent, Kafka's at-least-once delivery is safe: a
-redelivered event is recognised and skipped.
+### Happy path
 
-## Key Decisions
+```
+Client
+  │
+  ├─POST /bookings──────────────────────────►booking-service
+  │                                          PENDING_RESERVATION + BookingCreated → outbox
+  │
+  │   [outbox relay publishes to "bookings"]
+  │
+  │                                          inventory-service consumes BookingCreated
+  │                                          → seat HOLD (5 min TTL), optimistic lock
+  │                                          SeatsReserved → outbox
+  │
+  │   [outbox relay publishes to "inventory"]
+  │
+  │                                          booking-service consumes SeatsReserved
+  │                                          → AWAITING_PAYMENT
+  │                                          → POST /payments (Idempotency-Key=bookingId)
+  │                                          payment-service: PENDING→SUCCEEDED
+  │                                          booking-service: CONFIRMED + BookingConfirmed → outbox
+  │
+  │   [outbox relay publishes to "bookings"]
+  │
+  │                                          inventory-service consumes BookingConfirmed
+  │                                          → hold converted to sold (availableSeats--)
+  │
+  └─GET /bookings/{id}  status: CONFIRMED
+```
 
-- **Database per service.** `booking-service` and `inventory-service` each own
-  a PostgreSQL database and never share tables. This keeps their schemas
-  independent and enforces the service boundary.
-- **Flyway migrations per service.** Each service ships its own
-  `V1__init.sql`, so schema changes are versioned and applied on startup with
-  `ddl-auto: validate` guarding against drift.
-- **Idempotent consumer.** Seat decrements are tracked by booking id in a
-  dedicated `processed_bookings` table rather than relying on exactly-once
-  delivery semantics from the broker.
-- **Optimistic locking.** `event_inventory` carries a JPA `@Version` column so
-  concurrent decrements fail fast instead of silently overselling.
-- **Duplicated event DTOs.** Each service defines its own copy of the event
-  classes. This avoids a shared library that would couple the services'
-  release cycles; the wire contract is JSON, and the deserializer ignores type
-  headers so the two copies interoperate.
-- **Reactive gateway.** `api-gateway` uses Spring Cloud Gateway on WebFlux and
-  deliberately excludes `spring-boot-starter-web` to avoid a servlet/reactive
-  stack clash.
+### Payment-failure compensation
+
+```
+  ... (same up to payment call)
+  booking-service: payment returns FAILED (or circuit-breaker fallback)
+  → PAYMENT_FAILED + BookingPaymentFailed → outbox
+
+  [relay publishes to "bookings"]
+
+  inventory-service consumes BookingPaymentFailed
+  → seat hold DELETED (compensating transaction)
+  seats are now available again
+```
+
+### Hold expiry (TTL path)
+
+```
+  inventory-service @Scheduled (30s sweeper)
+  → deletes seat_holds rows where expires_at < now()
+  → seats become implicitly available (not counted in active holds)
+
+  If BookingConfirmed arrives after hold expiry:
+  → inventory-service detects missing/expired hold
+  → emits SeatsRejected to "inventory"
+  → booking-service marks booking REJECTED
+```
+
+---
+
+## Design Decisions
+
+### Transactional Outbox (dual-write problem)
+
+A service must atomically update its own database AND notify other services. Writing
+directly to Kafka in the same business transaction is not possible without XA
+transactions. The outbox pattern solves this: the domain change and a pending
+outbox row are committed in the same local transaction. A separate `@Scheduled`
+relay thread reads unpublished rows and publishes to Kafka, then marks them
+published. On relay failure the row stays unpublished and retries on the next tick,
+giving at-least-once delivery.
+
+Consumers must therefore be idempotent — they check a `processed_bookings` or
+`processed_events` table before acting.
+
+### Choreography vs Orchestration
+
+This saga uses choreography: each service reacts to events without a central
+coordinator. This avoids a single point of failure and keeps services decoupled.
+The trade-off is that the full saga flow is harder to visualise — it is spread
+across multiple listener classes rather than one orchestrator class. Orchestration
+(e.g. via a booking-service state machine) would give better observability at the
+cost of coupling.
+
+### Idempotent Consumers
+
+Every consumer records processed event keys before acting. `inventory-service`
+uses `processed_bookings (booking_id UNIQUE)`. `booking-service` uses
+`processed_events (event_key UNIQUE)` where the key is `"{EventType}:{bookingId}"`.
+On duplicate delivery, the consumer returns early without side effects.
+
+### Optimistic-Lock No-Oversell Invariant
+
+`EventInventory` carries a JPA `@Version` column. When two threads attempt to
+update the same row concurrently, one will receive an `OptimisticLockingFailureException`.
+`InventoryService.processBooking` retries once on that exception; if it still fails,
+the booking is rejected. This prevents overselling at the database level without
+row-level locks.
+
+### Seat-Hold TTL
+
+Seat holds are rows in `seat_holds (booking_id PK, event_id, seats, expires_at)`.
+Available capacity is computed as `availableSeats - SUM(active_holds)`, preserving
+the invariant `sold + active_holds <= total_seats`. A 30-second sweeper deletes
+expired holds. If a `BookingConfirmed` arrives after the hold has expired, the
+inventory service detects the missing hold and emits `SeatsRejected` so the
+booking is marked `REJECTED`. This keeps the invariant correct at the cost of
+occasionally rejecting a late confirmation.
+
+### Unit Price Simplification
+
+Booking amount = `seatCount × $25.00 USD`. This hardcoded price is intentional —
+the platform has no event-pricing model. The constant lives in
+`BookingService.SEAT_PRICE` and the simplification is documented here.
+
+### Payment Resilience
+
+`SimulatedGatewayClient` succeeds ~70% of the time. It is wrapped in:
+- `@Retry(name="gateway", maxAttempts=3, waitDuration=200ms)` — transparently
+  retries transient failures before the circuit breaker sees them.
+- `@CircuitBreaker(name="gateway", fallbackMethod="chargeFallback")` — after
+  50% failure rate in a 10-request sliding window, opens for 10 s and returns
+  `GatewayResult(false, null)` immediately, triggering the `PAYMENT_FAILED`
+  compensation path.
+
+### Redis Idempotency (payment-service)
+
+`payment-service` stores `idempotency:<key> → paymentId` in Redis with a 24-hour
+TTL. On repeated requests with the same `Idempotency-Key` header, the existing
+payment is returned without re-charging. In tests, Redis autoconfiguration is
+excluded and `StringRedisTemplate` is mocked via Mockito.
+
+---
 
 ## How to Run
-
-Everything is wired together with Docker Compose — Kafka, ZooKeeper, both
-databases, and all three services:
 
 ```bash
 docker compose up --build
 ```
 
-The gateway is then available on `http://localhost:8080`.
+The gateway is then available at `http://localhost:8080`.
 
-To build and test the whole project locally without Docker:
+Build and test without Docker (no broker or database required):
 
 ```bash
 mvn -B verify
 ```
 
-Tests run against in-memory H2 with Kafka auto-configuration excluded, so no
-broker or database is required for `mvn test`.
+---
 
 ## API Examples (through the gateway)
 
-Create a booking:
+Create a booking (starts the saga):
 
 ```bash
 curl -X POST http://localhost:8080/bookings \
@@ -135,57 +208,103 @@ curl -X POST http://localhost:8080/bookings \
   -d '{"eventId":"EVT-001","customerId":"CUST-42","seatCount":3}'
 ```
 
-List all bookings:
-
-```bash
-curl http://localhost:8080/bookings
-```
-
-Fetch a single booking:
+Poll booking status:
 
 ```bash
 curl http://localhost:8080/bookings/1
+# status progresses: PENDING_RESERVATION → AWAITING_PAYMENT → CONFIRMED
 ```
 
-Check seat availability for an event (the inventory service is seeded with
-`EVT-001`, `EVT-002`, and `EVT-003`):
+Check seat availability (reflects active holds):
 
 ```bash
 curl http://localhost:8080/inventory/EVT-001/availability
 ```
 
-A moment after creating the booking above, the same availability call reflects
-the decremented seat count — that is the asynchronous flow completing.
+Submit a payment directly:
+
+```bash
+curl -X POST http://localhost:8080/payments \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: my-unique-key-001" \
+  -d '{"bookingId":1,"amount":"75.00","currency":"USD","method":"CARD"}'
+```
+
+---
+
+## Load Test
+
+See [`loadtest/README.md`](loadtest/README.md) for instructions on running the
+k6 concurrency/oversell proof.
+
+## Load Test Results
+
+Measured against the full docker compose stack (all four services + Kafka + three
+Postgres instances + Redis) on a development laptop, k6 running in Docker with
+50 concurrent VUs firing bookings through the API gateway.
+
+**Run 1 — clean 50-seat event, 300 bookings (~450 seats demanded):**
+
+| Metric | Result |
+|---|---|
+| Request throughput | 1,351 req/s |
+| `POST /bookings` latency | med 34 ms · p95 66 ms · max 93 ms |
+| Requests accepted | 300 / 300 |
+| Final ledger | 39 seats sold + 0 active holds ≤ 50 capacity |
+| CONFIRMED seat sum vs inventory sold count | exact match (39 = 39) |
+| Payment failures | 7 bookings (11 seats) — every hold released by compensation |
+| **Oversell violations** | **0** |
+
+**Run 2 — 100-seat event under payment-gateway duress, 306 bookings (~458 seats demanded):**
+the burst tripped the payment circuit breaker, producing 52 payment failures
+(78 seats). Every failed booking's hold was released by the compensating
+transaction — final state: 26 seats sold, 0 stuck holds, 0 oversell violations,
+and the CONFIRMED seat sum again matched the inventory sold count exactly.
+
+The invariant `sold + active_holds <= total_seats` held at every observation
+point in both runs.
+
+---
 
 ## Observability
 
-Every service exposes Spring Boot Actuator with a Micrometer Prometheus
-registry:
+Every service exposes Spring Boot Actuator:
 
-- Health: `/actuator/health` (details always shown)
-- Prometheus scrape endpoint: `/actuator/prometheus`
-- Metrics browser: `/actuator/metrics`
+- `GET /actuator/health` — liveness/readiness
+- `GET /actuator/prometheus` — Prometheus metrics scrape endpoint
+- `GET /actuator/metrics` — metrics browser
 
-These are reachable per service (ports 8080/8081/8082) and the gateway also
-publishes its own actuator endpoints. Point a Prometheus instance at the
-`/actuator/prometheus` endpoints to collect JVM, HTTP, and Kafka client
-metrics; the health endpoints are suitable as container liveness/readiness
-probes.
+Ports: gateway 8080, booking-service 8081, inventory-service 8082, payment-service 8083.
 
-Interactive API documentation (springdoc-openapi / Swagger UI) is available on
-the two business services at `/swagger-ui.html`.
+Interactive API docs (Swagger UI) are available at `/swagger-ui.html` on the
+three business services.
+
+---
 
 ## Project Layout
 
 ```
 event-ticketing-platform/
-├── pom.xml                     parent aggregator + dependency management
+├── pom.xml                         parent aggregator + dependency management
 ├── docker-compose.yml
+├── loadtest/
+│   ├── oversell-test.js            k6 concurrency proof
+│   └── README.md
 ├── api-gateway/
 ├── booking-service/
 │   └── src/main/java/com/nikita/ticketing/booking/
-│       ├── controller/  service/  repository/  domain/  dto/  events/  config/  exception/
-└── inventory-service/
-    └── src/main/java/com/nikita/ticketing/inventory/
-        ├── controller/  service/  repository/  domain/  dto/  events/  config/  kafka/  exception/
+│       ├── controller/  service/  repository/  domain/
+│       ├── dto/  events/  config/  exception/
+│       ├── outbox/          OutboxEvent, OutboxEventRepository, OutboxRelay
+│       └── kafka/           InventoryEventListener
+├── inventory-service/
+│   └── src/main/java/com/nikita/ticketing/inventory/
+│       ├── controller/  service/  repository/  domain/
+│       ├── dto/  events/  config/  kafka/  exception/
+│       └── outbox/          OutboxEvent, OutboxEventRepository, OutboxRelay
+└── payment-service/
+    └── src/main/java/com/nikita/ticketing/payment/
+        ├── controller/  service/  repository/  domain/
+        ├── dto/  gateway/  exception/
+        └── PaymentServiceApplication.java
 ```
