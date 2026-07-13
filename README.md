@@ -5,6 +5,8 @@ choreography-based saga, transactional outbox, seat holds, and a payment leg.
 
 ![Saga demo — booking confirmation and payment-failure compensation](docs/demo.gif)
 
+▶ **[Watch as a video (pausable / scrubbable)](docs/demo.mp4)**
+
 *The booking saga running through the API gateway: a payment that succeeds
 confirms the booking and sells the seats, while a payment the gateway rejects
 triggers a compensating transaction that releases the held seats — no oversell.
