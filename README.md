@@ -3,6 +3,13 @@
 A Kafka-backed microservices platform for booking event tickets, extended with a
 choreography-based saga, transactional outbox, seat holds, and a payment leg.
 
+![Saga demo — booking confirmation and payment-failure compensation](docs/demo.gif)
+
+*The booking saga running through the API gateway: a payment that succeeds
+confirms the booking and sells the seats, while a payment the gateway rejects
+triggers a compensating transaction that releases the held seats — no oversell.
+Run it yourself with `docker compose up`.*
+
 ## Architecture
 
 ```
