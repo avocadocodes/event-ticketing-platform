@@ -3,9 +3,7 @@
 A Kafka-backed microservices platform for booking event tickets, extended with a
 choreography-based saga, transactional outbox, seat holds, and a payment leg.
 
-![Saga demo — booking confirmation and payment-failure compensation](docs/demo.gif)
-
-▶ **[Watch as a video (pausable / scrubbable)](docs/demo.mp4)**
+<video src="https://raw.githubusercontent.com/avocadocodes/event-ticketing-platform/main/docs/demo.mp4" controls autoplay muted loop width="900"></video>
 
 *The booking saga running through the API gateway: a payment that succeeds
 confirms the booking and sells the seats, while a payment the gateway rejects
